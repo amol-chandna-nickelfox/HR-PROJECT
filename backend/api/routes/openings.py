@@ -1,27 +1,32 @@
 import os
+import uuid
 from collections import defaultdict
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from backend.app.state import opening_store
-from backend.app.database import _save_opening, _delete_opening
+from backend.app.state import opening_store, DEFAULT_QUALIFICATION_THRESHOLD
+from backend.app.database import _save_opening, _delete_opening, _parse_interview_score, _combined_score
 from backend.services.interviewer import claude_client, CLAUDE_MODEL
 
 router = APIRouter()
 
 
 class OpeningCreate(BaseModel):
-    id: str
+    # id is accepted for backward compatibility with older frontend builds but ignored —
+    # the server always generates a fresh UUID (a client timestamp risked collisions).
+    id: str | None = None
     title: str
     jd: str = ''
     createdAt: str = ''
     jd_fields: dict | None = None
+    qualification_threshold: int | None = Field(default=None, ge=0, le=100)
 
 
 class OpeningUpdate(BaseModel):
     title: str | None = None
     jd: str | None = None
+    qualification_threshold: int | None = Field(default=None, ge=0, le=100)
 
 
 class JdGenerateRequest(BaseModel):
@@ -88,15 +93,17 @@ Instructions:
 
 @router.post("/openings", status_code=201)
 async def create_opening(req: OpeningCreate):
-    opening_store[req.id] = {
-        "id":        req.id,
+    oid = str(uuid.uuid4())
+    opening_store[oid] = {
+        "id":        oid,
         "title":     req.title,
         "jd":        req.jd,
         "createdAt": req.createdAt,
         "jd_fields": req.jd_fields or {},
+        "qualification_threshold": req.qualification_threshold if req.qualification_threshold is not None else DEFAULT_QUALIFICATION_THRESHOLD,
     }
-    _save_opening(req.id, opening_store[req.id])
-    return opening_store[req.id]
+    _save_opening(oid, opening_store[oid])
+    return opening_store[oid]
 
 
 @router.get("/openings")
@@ -117,7 +124,7 @@ async def list_openings_full():
     try:
         with _db_engine.connect() as conn:
             rows = conn.execute(_sql("""
-                SELECT bc.batch_id, bc.single_id,
+                SELECT bc.id AS bc_id, bc.batch_id, bc.single_id,
                        COALESCE(bc.opening_id, b.opening_id) AS opening_id,
                        bc.interview_id,
                        bc.file_name, bc.name, bc.email, bc.phone,
@@ -142,6 +149,7 @@ async def list_openings_full():
     for row in rows:
         c = dict(row)
         oid            = c.pop("opening_id", None)
+        c["_bcId"]     = c.pop("bc_id", None)
         c["_batchId"]  = c.pop("batch_id", None)
         c["_singleId"] = c.pop("single_id", None)
         c["_type"]     = "single" if c["_singleId"] else "batch"
@@ -163,16 +171,10 @@ async def list_openings_full():
                 c["score_result"] = iv_score_result
 
         if c.get("score_result") and c.get("interview_score") is None:
-            try:
-                raw    = c["score_result"].get("interview_score", "0")
-                iscore = int(str(raw).split("/")[0].strip())
-                if iscore > 0:
-                    c["interview_score"] = iscore
-                    rscore = c.get("resume_score")
-                    if rscore is not None:
-                        c["combined_score"] = round(rscore * 0.4 + iscore * 0.6)
-            except Exception:
-                pass
+            iscore = _parse_interview_score(c["score_result"])
+            if iscore:
+                c["interview_score"] = iscore
+                c["combined_score"]  = _combined_score(c.get("resume_score"), iscore)
 
         if c.get("callback_scheduled_at"):
             c["callback_scheduled_at"] = c["callback_scheduled_at"].isoformat()
@@ -202,6 +204,8 @@ async def update_opening(opening_id: str, req: OpeningUpdate):
         o["title"] = req.title
     if req.jd is not None:
         o["jd"] = req.jd
+    if req.qualification_threshold is not None:
+        o["qualification_threshold"] = req.qualification_threshold
     _save_opening(opening_id, o)
     return o
 
@@ -221,7 +225,7 @@ async def get_opening_candidates(opening_id: str):
     try:
         with _db_engine.connect() as conn:
             rows = conn.execute(_sql("""
-                SELECT bc.batch_id, bc.single_id, bc.interview_id, bc.file_name, bc.name, bc.email, bc.phone,
+                SELECT bc.id AS bc_id, bc.batch_id, bc.single_id, bc.interview_id, bc.file_name, bc.name, bc.email, bc.phone,
                        bc.resume_score, bc.filter_status, bc.interview_status,
                        bc.interview_score, bc.combined_score, bc.callback_scheduled_at,
                        bc.analyze_result, bc.score_result,
@@ -240,6 +244,7 @@ async def get_opening_candidates(opening_id: str):
     candidates = []
     for row in rows:
         c = dict(row)
+        c["_bcId"]     = c.pop("bc_id", None)
         c["_batchId"]  = c.pop("batch_id", None)
         c["_singleId"] = c.pop("single_id", None)
         c["_type"]     = "single" if c["_singleId"] else "batch"
@@ -267,16 +272,10 @@ async def get_opening_candidates(opening_id: str):
                 c["score_result"] = iv_score_result
 
         if c.get("score_result") and c.get("interview_score") is None:
-            try:
-                raw    = c["score_result"].get("interview_score", "0")
-                iscore = int(str(raw).split("/")[0].strip())
-                if iscore > 0:
-                    c["interview_score"] = iscore
-                    rscore = c.get("resume_score")
-                    if rscore is not None:
-                        c["combined_score"] = round(rscore * 0.4 + iscore * 0.6)
-            except Exception:
-                pass
+            iscore = _parse_interview_score(c["score_result"])
+            if iscore:
+                c["interview_score"] = iscore
+                c["combined_score"]  = _combined_score(c.get("resume_score"), iscore)
 
         if c.get("callback_scheduled_at"):
             c["callback_scheduled_at"] = c["callback_scheduled_at"].isoformat()

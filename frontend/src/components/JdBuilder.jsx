@@ -12,6 +12,7 @@ const EMPTY_FORM = {
   preferredQualifications: '',
   workMode:                '',
   perks:                   '',
+  qualificationThreshold:  70,
 }
 
 const _loadDraft = () => {
@@ -64,12 +65,11 @@ export default function JdBuilder({ onNavigate, syncOpenings }) {
     if (!generatedJd.trim()) return
     setCreating(true)
     try {
-      const id = Date.now().toString()
       await apiCreateOpening({
-        id,
         title:     form.jobTitle.trim(),
         jd:        generatedJd.trim(),
         createdAt: new Date().toISOString().slice(0, 10),
+        qualification_threshold: Number(form.qualificationThreshold) || 70,
         jd_fields: {
           jobTitle:                form.jobTitle,
           experienceLevel:         form.experienceLevel,
@@ -265,6 +265,23 @@ export default function JdBuilder({ onNavigate, syncOpenings }) {
               />
             </div>
 
+            {/* Qualification threshold — scoring config, not JD content */}
+            <div>
+              <label style={labelStyle}>
+                Qualification Threshold
+                <span style={{ color: 'var(--text-3)', fontWeight: 400 }}> (resume score to auto-mark "qualified")</span>
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                className="opening-form-input"
+                value={form.qualificationThreshold}
+                onChange={e => setForm(f => ({ ...f, qualificationThreshold: e.target.value }))}
+                style={{ width: 120, boxSizing: 'border-box' }}
+              />
+            </div>
+
             <button
               className="btn-analyze"
               onClick={handleGenerate}
@@ -338,6 +355,15 @@ export default function JdBuilder({ onNavigate, syncOpenings }) {
                   style={{ flex: '0 0 auto', padding: '10px 20px' }}
                 >
                   Start Over
+                </button>
+                <button
+                  className="btn-clear"
+                  onClick={handleGenerate}
+                  disabled={generating}
+                  title="Re-run generation using the current form fields — replaces the text below, including any manual edits"
+                  style={{ flex: '0 0 auto', padding: '10px 20px' }}
+                >
+                  🔄 Regenerate
                 </button>
                 <CopyButton text={generatedJd} />
                 <button

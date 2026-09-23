@@ -81,6 +81,13 @@ export const apiGetOpeningCandidates = (id) =>
 export const apiForceResolve = (interviewId) =>
   fetch(`/interview/force-resolve/${interviewId}`, { method: 'POST', headers: authHeaders() })
 
+export const apiQualifyCandidate = (bcId) =>
+  fetch('/batch/candidates/qualify', {
+    method:  'PUT',
+    headers: jsonHeaders(),
+    body:    JSON.stringify({ bc_id: bcId }),
+  })
+
 export const apiActiveCalls = () =>
   fetch('/calls/active', { headers: authHeaders() })
 

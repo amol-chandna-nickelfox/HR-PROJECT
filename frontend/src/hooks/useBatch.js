@@ -32,6 +32,14 @@ export function useBatch({ onSyncToOpenings, onAutoSaveJd, getActiveOpeningTitle
   }
 
   const handleBatchStart = async (files, jd) => {
+    const openingId = getActiveOpeningId?.() || ''
+    if (!openingId) {
+      const proceed = window.confirm(
+        'No job opening is selected — this batch won\'t appear on any opening\'s candidate list ' +
+        'or dashboard card, only in this session\'s results view. Continue anyway?'
+      )
+      if (!proceed) return
+    }
     setBatchLoading(true)
     setBatchError('')
     setBatchData(null)
@@ -39,7 +47,7 @@ export function useBatch({ onSyncToOpenings, onAutoSaveJd, getActiveOpeningTitle
     const form = new FormData()
     form.append('jd_text', jd)
     form.append('job_title', getActiveOpeningTitle?.() || '')
-    form.append('opening_id', getActiveOpeningId?.() || '')
+    form.append('opening_id', openingId)
     files.forEach(f => form.append('files', f))
     try {
       const res = await apiStartBatch(form)

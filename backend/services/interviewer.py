@@ -115,6 +115,17 @@ JOB DESCRIPTION:
     return json.loads(_strip_json(raw))
 
 
+def _answer_path(provider: str, interview_id: str) -> str:
+    """Answer-URL path for the active interview mode.
+
+    streaming → the Stream-XML routes (backend/api/routes/stream.py) that hand
+    the call to the Pipecat voice agent; legacy → the classic webhook flow.
+    """
+    if settings_store.get("interview_mode", "legacy") == "streaming":
+        return f"/{provider}/stream-xml/{interview_id}"
+    return f"/{provider}/start/{interview_id}"
+
+
 def _start_twilio_call(phone_number: str, interview_id: str) -> dict:
     if not twilio_client or not TWILIO_PHONE:
         raise Exception("Twilio credentials missing — set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER in .env")
@@ -128,11 +139,11 @@ def _start_twilio_call(phone_number: str, interview_id: str) -> dict:
         to = f"+{digits}"
 
     base_url = os.getenv("BASE_URL", "").rstrip("/")
-    print(f"[Twilio] Calling {to}, interview_id={interview_id}")
+    print(f"[Twilio] Calling {to}, interview_id={interview_id} (mode={settings_store.get('interview_mode', 'legacy')})")
     call = twilio_client.calls.create(
         to=to,
         from_=TWILIO_PHONE,
-        url=f"{base_url}/twilio/start/{interview_id}",
+        url=f"{base_url}{_answer_path('twilio', interview_id)}",
         status_callback=f"{base_url}/twilio/status/{interview_id}",
         status_callback_event=["initiated", "ringing", "answered", "completed"],
         timeout=20,
@@ -159,11 +170,11 @@ def _start_plivo_call(phone_number: str, interview_id: str) -> dict:
         to = f"+{digits}"
 
     base_url = os.getenv("BASE_URL", "").rstrip("/")
-    print(f"[Plivo] Calling {to}, interview_id={interview_id}")
+    print(f"[Plivo] Calling {to}, interview_id={interview_id} (mode={settings_store.get('interview_mode', 'legacy')})")
     response = plivo_client.calls.create(
         from_=PLIVO_PHONE,
         to_=to,
-        answer_url=f"{base_url}/plivo/start/{interview_id}",
+        answer_url=f"{base_url}{_answer_path('plivo', interview_id)}",
         hangup_url=f"{base_url}/plivo/status/{interview_id}",
         ring_timeout=20,
         # Observe-only for now — Plivo's AMD false-positived on real pickups previously,
@@ -189,8 +200,185 @@ def start_twilio_call(phone_number: str, interview_id: str) -> dict:
 # recognize this exact marker and avoid caching it as final — see comment at those call sites.
 HALLUCINATION_MARKER = "[unclear response — possible transcription error]"
 
+# Whisper output language. Candidates speak English, Hindi, or Hinglish. This was previously
+# hardcoded to "hi", which forced Whisper to render English speech phonetically in Devanagari
+# — e.g. "and I requested my boss to give it to me" came back as
+# "और आई रिक्वेस्टिड माइबॉस टो गिव इट टो मी" — unreadable and useless for scoring.
+# "en" keeps output in readable English for English and Hinglish speech alike.
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en")
 
-def transcribe_recording(recording_url: str, *, fast: bool = False) -> str:
+# Common words to keep out of the vocabulary hint — they carry no proper-noun signal and
+# would just crowd out the useful terms inside Whisper's limited prompt budget.
+_VOCAB_STOPWORDS = {
+    "I", "A", "An", "The", "And", "But", "Or", "If", "In", "On", "At", "To", "For", "Of",
+    "With", "My", "We", "You", "He", "She", "It", "They", "This", "That", "These", "Those",
+    "What", "When", "Where", "Why", "How", "Who", "Which", "Can", "Could", "Would", "Should",
+    "Tell", "Describe", "Explain", "Walk", "Yes", "No", "Please", "Thanks", "Hello", "Hi",
+    "Job", "Role", "Work", "Team", "Time", "Year", "Years", "Company", "Experience",
+}
+
+# Capitalised words (Rahul, Python, NickelFox) and all-caps acronyms (NSUIT, AWS, API).
+_VOCAB_TOKEN_RE = re.compile(r"\b(?:[A-Z]{2,}|[A-Z][a-zA-Z0-9+#.]{1,})\b")
+
+
+def build_vocab_hint(*sources: str | None, max_terms: int = 40) -> str | None:
+    """Build a Whisper prompt biasing recognition toward this candidate's proper nouns.
+
+    Whisper reliably mangles domain/proper nouns it has no context for — an observed case was
+    a candidate saying "NSUIT" being transcribed as "MSU IT". Seeding a short glossary drawn
+    from the candidate's own resume/JD/name fixes those, verified against real call audio.
+
+    Returns a closed, period-terminated list (never an unfinished sentence) so Whisper treats
+    it as vocabulary rather than a prefix to continue — see the note at the prompt call site.
+    """
+    seen: list[str] = []
+    for src in sources:
+        if not src:
+            continue
+        for tok in _VOCAB_TOKEN_RE.findall(str(src)):
+            if tok in _VOCAB_STOPWORDS or len(tok) < 2:
+                continue
+            if tok not in seen:
+                seen.append(tok)
+            if len(seen) >= max_terms:
+                break
+        if len(seen) >= max_terms:
+            break
+    if not seen:
+        return None
+    return "Glossary of names and terms that may appear: " + ", ".join(seen) + "."
+
+
+# The scoring rubric's real caps. The prompt asks Claude for these ranges, but asking is not
+# enforcing — an observed result came back with behavioral_quality 20/15 (133%), inflating the
+# headline total by 5 points. These are the authority; whatever the model reports is clamped.
+_SCORE_DIMENSIONS = (
+    ("communication",      35),
+    ("confidence",         30),
+    ("motivation_fit",     20),
+    ("behavioral_quality", 15),
+)
+
+
+def _normalize_score_result(result: dict) -> dict:
+    """Clamp each dimension to its real maximum and recompute the headline total from the parts.
+
+    Two problems this closes:
+      * a dimension score above its cap (seen live: 20 out of a possible 15) silently inflated
+        the total, so a candidate's score could exceed what the rubric allows;
+      * "interview_score" was a string the model wrote independently of the dimensions, so the
+        headline number and the breakdown could disagree with each other.
+
+    The total is only rewritten when at least one dimension parsed as a number, so an explicit
+    non-numeric result (e.g. "Unable to Score" on an empty transcript) is left intact.
+    """
+    if not isinstance(result, dict):
+        return result
+    total = 0
+    parsed_any = False
+    for key, cap in _SCORE_DIMENSIONS:
+        d = result.get(key)
+        d = d if isinstance(d, dict) else {}
+        raw = d.get("score")
+        try:
+            score = int(round(float(raw)))
+            parsed_any = True
+        except (TypeError, ValueError):
+            score = 0
+        if score > cap:
+            print(f"[Score] {key}={score} exceeds its maximum of {cap} — clamping")
+            score = cap
+        elif score < 0:
+            score = 0
+        result[key] = {"score": score, "max": cap}
+        total += score
+    if parsed_any:
+        prev = str(result.get("interview_score", ""))
+        result["interview_score"] = f"{total} / 100"
+        if prev and prev.split("/")[0].strip() not in (str(total),):
+            print(f"[Score] headline was {prev!r}; recomputed from dimensions as {total} / 100")
+    return result
+
+
+_LIVE_CALL_STATES = {"queued", "ringing", "in-progress", "in_progress"}
+
+
+def is_call_active(call_id: str) -> bool | None:
+    """Does the provider still consider this call live?
+
+    The authoritative answer to "has this call ended", and the guard that stops a reconciliation
+    sweep from declaring a call over while the candidate is still on the phone. Returns None
+    when it cannot be determined, so callers must treat None as "unknown", never as "ended".
+    """
+    if not call_id:
+        return None
+    if twilio_client:
+        try:
+            return twilio_client.calls(call_id).fetch().status in _LIVE_CALL_STATES
+        except Exception as e:
+            print(f"[CallStatus] Twilio lookup failed for {call_id}: {e}")
+    if plivo_client:
+        try:
+            plivo_client.live_calls.get(call_id)
+            return True          # present among live calls ⇒ still active
+        except Exception:
+            return None          # absent or lookup failed — genuinely unknown
+    return None
+
+
+def list_answer_recordings(call_id: str) -> list[dict]:
+    """Answer recordings the provider holds for a call, oldest first.
+
+    Exists to recover answers the provider captured but never delivered to us. If a candidate
+    hangs up right after finishing an answer, Twilio ends the <Record> and fires the
+    call-status callback *instead of* the Record action URL — so the app never learns that
+    recording's URL and the answer is lost even though the audio exists. Observed live: a
+    58-second answer to the final question was stored as "[no recording]".
+
+    Returns [{'sid','url','duration','created'}]. Never raises — a lookup failure just yields
+    an empty list, leaving the interview exactly as it was.
+    """
+    out: list[dict] = []
+    if not call_id:
+        return out
+
+    if twilio_client:
+        try:
+            for r in twilio_client.recordings.list(call_sid=call_id, limit=50):
+                # RecordVerb = a <Record> answer. Excludes the full-call recording (OutboundAPI).
+                if getattr(r, "source", "") != "RecordVerb":
+                    continue
+                out.append({
+                    "sid":      r.sid,
+                    "url":      f"https://api.twilio.com/2010-04-01/Accounts/{r.account_sid}/Recordings/{r.sid}",
+                    "duration": int(getattr(r, "duration", 0) or 0),
+                    "created":  getattr(r, "date_created", None),
+                })
+        except Exception as e:
+            print(f"[Recover] Twilio recording lookup failed for {call_id}: {e}")
+
+    # twilio_call_sid doubles as Plivo's CallUUID, so try Plivo when Twilio returned nothing.
+    if not out and plivo_client:
+        try:
+            for r in plivo_client.recordings.list(call_uuid=call_id, limit=50):
+                url = getattr(r, "recording_url", None)
+                if not url:
+                    continue
+                out.append({
+                    "sid":      getattr(r, "recording_id", None) or str(url).rstrip("/").split("/")[-1],
+                    "url":      url,
+                    "duration": int(float(getattr(r, "recording_duration_ms", 0) or 0) / 1000)
+                                 or int(getattr(r, "duration", 0) or 0),
+                    "created":  getattr(r, "add_time", None),
+                })
+        except Exception as e:
+            print(f"[Recover] Plivo recording lookup failed for {call_id}: {e}")
+
+    out.sort(key=lambda x: (x["created"] is None, x["created"]))
+    return out
+
+
+def transcribe_recording(recording_url: str, *, fast: bool = False, vocab: str | None = None) -> str:
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
         return "[transcription skipped — no GROQ_API_KEY set]"
@@ -242,15 +430,26 @@ def transcribe_recording(recording_url: str, *, fast: bool = False) -> str:
 
     from groq import Groq
     client = Groq(api_key=groq_key)
+
+    # Transcribe (not translate) so the output stays verbatim — the translate task
+    # paraphrases, which loses the candidate's actual wording. language=WHISPER_LANGUAGE
+    # ("en" by default) keeps output in English even for Hinglish speech.
+    kwargs = {}
+    if vocab:
+        # A short glossary of proper nouns relevant to THIS candidate (their name, college,
+        # employers, technologies) — biases Whisper so e.g. "NSUIT" isn't heard as "MSU IT".
+        # Deliberately a comma-separated list terminated with a period: the earlier
+        # hallucination problem came from a prompt that ended mid-sentence (e.g. a dangling
+        # "Candidate:" cue), which Whisper "continued" instead of transcribing. A closed list
+        # gives it vocabulary without an unfinished thought to complete. The
+        # _is_hallucinated_transcript() guard below still applies as a backstop.
+        kwargs["prompt"] = vocab
     result = client.audio.transcriptions.create(
         file=("answer.mp3", audio_resp.content),
         model=model,
-        language="hi",
+        language=WHISPER_LANGUAGE,
         temperature=0,
-        # No prompt: Whisper treats the prompt as prior context and, on silence/noisy/
-        # ambiguous audio, hallucinates fluent-but-fabricated continuations of it. A prompt
-        # ending mid-sentence (e.g. dialogue cut off at "Candidate:") previously caused
-        # exactly that — the model "continuing" the dangling cue instead of transcribing.
+        **kwargs,
     )
     text = result.text.strip()
     if _is_hallucinated_transcript(text):
@@ -352,4 +551,4 @@ Return this exact JSON (no markdown):
 }}"""
 
     raw = _claude("You are an experienced HR recruiter. Return only valid JSON.", prompt)
-    return json.loads(_strip_json(raw))
+    return _normalize_score_result(json.loads(_strip_json(raw)))

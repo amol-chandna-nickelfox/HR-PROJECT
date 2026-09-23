@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import BatchCandidateModal from './BatchCandidateModal'
-import { apiForceResolve } from '../api/client'
+import { apiForceResolve, apiQualifyCandidate } from '../api/client'
 
 function scoreColor(n) {
   if (n == null) return 'batch-score-none'
@@ -28,6 +28,10 @@ function StatusBadge({ c }) {
   // no_phone is always terminal
   if (c.filter_status === 'no_phone') {
     return <span className="score-verdict score-verdict--sm" style={{ color: 'var(--text-3)' }}>No Phone</span>
+  }
+  // parse_failed: we never actually scored this resume — distinct from a genuine reject
+  if (c.filter_status === 'parse_failed') {
+    return <span className="score-verdict score-verdict--sm" style={{ color: 'var(--text-3)' }} title="Couldn't extract text from this file — try re-uploading it">⚠ Couldn't Read File</span>
   }
   // filtered_out: only show if no call has ever been made
   if (c.filter_status === 'filtered_out' && !hasActiveCall) {
@@ -73,6 +77,21 @@ function StatusBadge({ c }) {
     const cls = verdict.includes('Strongly') || verdict === 'Recommended'
       ? 'verdict-high'
       : verdict === 'Consider' ? 'verdict-medium' : 'verdict-low'
+    // An interview cut short is scored on what it captured, so unanswered questions drag the
+    // total down — which reads identically to a candidate who answered everything poorly.
+    // Flag it so the two aren't confused when reviewing the table.
+    const sr = c.score_result
+    if (sr?.incomplete) {
+      const n = sr.answered_count, t = sr.total_questions
+      return (
+        <span
+          className="score-verdict score-verdict--sm verdict-low"
+          title={`Call ended early — scored on only ${n} of ${t} answers, so this score understates the candidate. Consider re-calling them.`}
+        >
+          ⚠ Incomplete{(n != null && t != null) ? ` (${n}/${t})` : ''}
+        </span>
+      )
+    }
     return <span className={`score-verdict score-verdict--sm ${cls}`}>{verdict}</span>
   }
   return <span className="score-verdict score-verdict--sm" style={{ color: 'var(--text-3)' }}>—</span>
@@ -81,6 +100,8 @@ function StatusBadge({ c }) {
 export default function BatchResultsTable({ candidates = [], isComplete = true, onCallCandidate, canEdit = true, onResolve, allActiveCalls = [] }) {
   const [selected,    setSelected]    = useState(null)
   const [resolvedIds, setResolvedIds] = useState({}) // interview_id → resolved status
+  const [qualifying,  setQualifying]  = useState({}) // bc_id → in-flight
+  const [qualifiedOverrides, setQualifiedOverrides] = useState({}) // bc_id → true, once promoted
 
   const handleResolve = async (e, c) => {
     e.stopPropagation()
@@ -93,6 +114,23 @@ export default function BatchResultsTable({ candidates = [], isComplete = true, 
     } catch (_) {}
   }
 
+  const handleQualify = async (e, c) => {
+    e.stopPropagation()
+    const bcId = c._bcId ?? c._bc_id
+    if (!bcId || qualifying[bcId]) return
+    setQualifying(prev => ({ ...prev, [bcId]: true }))
+    try {
+      const res = await apiQualifyCandidate(bcId)
+      if (res.ok) {
+        setQualifiedOverrides(prev => ({ ...prev, [bcId]: true }))
+        if (onResolve) onResolve() // reuse the same "refresh parent data" callback
+      }
+    } catch (_) {
+    } finally {
+      setQualifying(prev => { const n = { ...prev }; delete n[bcId]; return n })
+    }
+  }
+
   const sorted = [...candidates].sort((a, b) => {
     const aQ = a.filter_status === 'qualified'
     const bQ = b.filter_status === 'qualified'
@@ -103,7 +141,8 @@ export default function BatchResultsTable({ candidates = [], isComplete = true, 
   })
 
   const qualified      = candidates.filter(c => c.filter_status === 'qualified').length
-  const filtered       = candidates.filter(c => c.filter_status === 'filtered_out' || c.filter_status === 'no_phone').length
+  const filtered       = candidates.filter(c => c.filter_status === 'filtered_out').length
+  const parseFailed    = candidates.filter(c => c.filter_status === 'parse_failed').length
   const interviewedCount = candidates.filter(c => c.interview_status === 'completed').length
   const doneCount      = candidates.filter(c =>
     ['completed', 'abandoned', 'failed', 'callback_scheduled', 'skipped', 'no_phone'].includes(c.interview_status)
@@ -118,8 +157,8 @@ export default function BatchResultsTable({ candidates = [], isComplete = true, 
         <span className="char-count">
           {isComplete
             ? interviewedCount > 0
-              ? `${interviewedCount} interviewed · ${filtered} filtered out`
-              : `${qualified} qualified · ${filtered} filtered out`
+              ? `${interviewedCount} interviewed · ${filtered} filtered out${parseFailed ? ` · ${parseFailed} unreadable` : ''}`
+              : `${qualified} qualified · ${filtered} filtered out${parseFailed ? ` · ${parseFailed} unreadable` : ''}`
             : `${doneCount} of ${candidates.length} done · click any row for details`
           }
         </span>
@@ -192,56 +231,76 @@ export default function BatchResultsTable({ candidates = [], isComplete = true, 
                     : <span className="batch-score-none">—</span>
                   }
                 </td>
-                <td>
-                  <StatusBadge c={resolvedIds[c.interview_id]
-                    ? { ...c, interview_status: resolvedIds[c.interview_id] }
-                    : c}
-                  />
-                </td>
-                {onCallCandidate && (
-                  <td onClick={e => e.stopPropagation()} style={{ whiteSpace: 'nowrap' }}>
-                    {(() => {
-                      const effectiveStatus = resolvedIds[c.interview_id] || c.interview_status
-                      const callAge = (() => {
-                        const log = c.call_log
-                        if (!Array.isArray(log) || !log.length) return Infinity
-                        const last = log[log.length - 1]?.started_at
-                        return last ? Date.now() - new Date(last).getTime() : Infinity
-                      })()
-                      // 'calling' can't stay in that state for >2 min (Twilio ring timeout is ~20s)
-                      // 'in_progress' can't exceed ~30 min (7 questions)
-                      const stuckThreshold = effectiveStatus === 'calling'
-                        ? 2 * 60 * 1000
-                        : 35 * 60 * 1000
-                      const isStuck = isComplete && c.interview_id
-                        && ['calling', 'in_progress'].includes(effectiveStatus)
-                        && callAge > stuckThreshold
-                      return (
-                        <>
-                          {isStuck && (
-                            <button
-                              className="batch-call-btn batch-call-btn--filtered"
-                              title="Force-resolve this stuck call"
-                              style={{ marginRight: 6, fontSize: '0.75rem', background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5' }}
-                              onClick={(e) => handleResolve(e, c)}
-                            >
-                              ✕ Resolve
-                            </button>
-                          )}
-                          {c.phone && c.filter_status !== 'no_phone' && !isStuck && (
-                            <button
-                              className={`batch-call-btn${c.filter_status !== 'qualified' ? ' batch-call-btn--filtered' : ''}`}
-                              title={c.filter_status !== 'qualified' ? 'Call (below qualification threshold)' : 'Call Candidate'}
-                              onClick={() => onCallCandidate(c)}
-                            >
-                              📞 Call
-                            </button>
-                          )}
-                        </>
-                      )
-                    })()}
-                  </td>
-                )}
+                {(() => {
+                  const bcId = c._bcId ?? c._bc_id
+                  const effectiveFilterStatus = (bcId && qualifiedOverrides[bcId]) ? 'qualified' : c.filter_status
+                  const displayC = resolvedIds[c.interview_id]
+                    ? { ...c, interview_status: resolvedIds[c.interview_id], filter_status: effectiveFilterStatus }
+                    : { ...c, filter_status: effectiveFilterStatus }
+                  return (
+                    <>
+                      <td>
+                        <StatusBadge c={displayC} />
+                      </td>
+                      {onCallCandidate && (
+                        <td onClick={e => e.stopPropagation()} style={{ whiteSpace: 'nowrap' }}>
+                          {(() => {
+                            const effectiveStatus = resolvedIds[c.interview_id] || c.interview_status
+                            const callAge = (() => {
+                              const log = c.call_log
+                              if (!Array.isArray(log) || !log.length) return Infinity
+                              const last = log[log.length - 1]?.started_at
+                              return last ? Date.now() - new Date(last).getTime() : Infinity
+                            })()
+                            // 'calling' can't stay in that state for >2 min (Twilio ring timeout is ~20s)
+                            // 'in_progress' can't exceed ~30 min (7 questions)
+                            const stuckThreshold = effectiveStatus === 'calling'
+                              ? 2 * 60 * 1000
+                              : 35 * 60 * 1000
+                            const isStuck = isComplete && c.interview_id
+                              && ['calling', 'in_progress'].includes(effectiveStatus)
+                              && callAge > stuckThreshold
+                            const canQualify = effectiveFilterStatus === 'filtered_out' && c.phone && bcId
+                            return (
+                              <>
+                                {isStuck && (
+                                  <button
+                                    className="batch-call-btn batch-call-btn--filtered"
+                                    title="Force-resolve this stuck call"
+                                    style={{ marginRight: 6, fontSize: '0.75rem', background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                                    onClick={(e) => handleResolve(e, c)}
+                                  >
+                                    ✕ Resolve
+                                  </button>
+                                )}
+                                {canQualify && (
+                                  <button
+                                    className="batch-call-btn batch-call-btn--filtered"
+                                    title="Manually promote this candidate to qualified — includes them in future 'Call All Qualified' runs"
+                                    style={{ marginRight: 6, fontSize: '0.75rem' }}
+                                    disabled={qualifying[bcId]}
+                                    onClick={(e) => handleQualify(e, c)}
+                                  >
+                                    {qualifying[bcId] ? '…' : '✓ Qualify Anyway'}
+                                  </button>
+                                )}
+                                {c.phone && effectiveFilterStatus !== 'no_phone' && !isStuck && (
+                                  <button
+                                    className={`batch-call-btn${effectiveFilterStatus !== 'qualified' ? ' batch-call-btn--filtered' : ''}`}
+                                    title={effectiveFilterStatus !== 'qualified' ? 'Call (below qualification threshold)' : 'Call Candidate'}
+                                    onClick={() => onCallCandidate(c)}
+                                  >
+                                    📞 Call
+                                  </button>
+                                )}
+                              </>
+                            )
+                          })()}
+                        </td>
+                      )}
+                    </>
+                  )
+                })()}
               </tr>
             ))}
           </tbody>

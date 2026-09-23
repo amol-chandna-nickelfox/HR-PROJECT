@@ -47,7 +47,7 @@ function PageIntro({ mode }) {
           <span className="step-arrow">→</span>
           <span className="page-intro-step"><span className="step-num">2</span> AI scores all</span>
           <span className="step-arrow">→</span>
-          <span className="page-intro-step"><span className="step-num">3</span> Filter ≥ 70</span>
+          <span className="page-intro-step"><span className="step-num">3</span> Filter by threshold</span>
           <span className="step-arrow">→</span>
           <span className="page-intro-step"><span className="step-num">4</span> Auto-interview</span>
           <span className="step-arrow">→</span>
@@ -355,7 +355,7 @@ export default function InputSection({
       <p className="hint">
         {isBatch
           ? batchFiles.length > 0
-            ? `${batchFiles.length} resume${batchFiles.length !== 1 ? 's' : ''} queued · candidates scoring ≥ 70 will be auto-interviewed`
+            ? `${batchFiles.length} resume${batchFiles.length !== 1 ? 's' : ''} queued · candidates above the qualification threshold will be auto-interviewed`
             : 'Drop files above or use the browser to add resumes'
           : <><kbd>Ctrl</kbd>+<kbd>Enter</kbd> to analyze · or drag a PDF onto the resume card</>
         }

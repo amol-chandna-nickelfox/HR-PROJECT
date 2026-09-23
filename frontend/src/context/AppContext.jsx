@@ -168,19 +168,29 @@ export function AppProvider({ children }) {
 
   const createOpening = () => {
     if (!newOpeningTitle.trim()) return
-    const o = {
-      id:        Date.now().toString(),
-      title:     newOpeningTitle.trim(),
-      jd:        newOpeningJd.trim(),
-      createdAt: new Date().toISOString().slice(0, 10),
-      stats:     { total: 0, qualified: 0, done: 0 },
-      batchIds:  [],
-      candidates: [],
-    }
-    const next = [...openings, o]
-    setOpenings(next); saveOpenings(next)
+    const title     = newOpeningTitle.trim()
+    const jd        = newOpeningJd.trim()
+    const createdAt = new Date().toISOString().slice(0, 10)
     setNewOpeningTitle(''); setNewOpeningJd(''); setShowOpeningForm(false)
-    apiCreateOpening({ id: o.id, title: o.title, jd: o.jd, createdAt: o.createdAt }).catch(() => {})
+    // Server generates the real id (a client timestamp risked collisions) — add the
+    // opening locally once the response comes back, rather than optimistically with a
+    // fabricated id that wouldn't match what's actually persisted.
+    apiCreateOpening({ title, jd, createdAt })
+      .then(r => r.json())
+      .then(created => {
+        const o = {
+          id:        created.id,
+          title:     created.title ?? title,
+          jd:        created.jd ?? jd,
+          createdAt: created.createdAt || createdAt,
+          stats:     { total: 0, qualified: 0, done: 0 },
+          batchIds:  [],
+          candidates: [],
+        }
+        const next = [...openings, o]
+        setOpenings(next); saveOpenings(next)
+      })
+      .catch(() => {})
   }
 
   const deleteOpening = (id) => {

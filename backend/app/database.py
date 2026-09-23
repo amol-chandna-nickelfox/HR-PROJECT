@@ -57,6 +57,7 @@ def _init_db():
             """))
             # Migrations for columns added after initial release
             conn.execute(_sql("ALTER TABLE job_openings ADD COLUMN IF NOT EXISTS jd_fields JSONB"))
+            conn.execute(_sql("ALTER TABLE job_openings ADD COLUMN IF NOT EXISTS qualification_threshold SMALLINT NOT NULL DEFAULT 70"))
             conn.execute(_sql("ALTER TABLE interviews ADD COLUMN IF NOT EXISTS opening_id TEXT REFERENCES job_openings(id) ON DELETE SET NULL"))
             conn.execute(_sql("CREATE INDEX IF NOT EXISTS idx_iv_status    ON interviews(status)"))
             conn.execute(_sql("CREATE INDEX IF NOT EXISTS idx_iv_phone     ON interviews(phone)"))
@@ -170,6 +171,18 @@ def _init_db():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """))
+            # Resume scoring is an LLM call, so it is not perfectly reproducible even at
+            # temperature=0 — the same resume against the same JD scored 51 once and 55 another
+            # time (skill_match 5 vs 9), which looks like a broken system to a recruiter. The
+            # in-process cache that was meant to prevent this died on every restart, so this
+            # persists it: the same inputs return the byte-identical result forever.
+            conn.execute(_sql("""
+                CREATE TABLE IF NOT EXISTS analyze_cache (
+                    key        TEXT        PRIMARY KEY,
+                    result     JSONB       NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
             conn.commit()
         print("[DB] PostgreSQL connected — tables ready")
     except Exception as e:
@@ -204,6 +217,56 @@ def _set_setting(key: str, value: str):
         print(f"[DB] _set_setting failed: {e}")
 
 
+def _parse_interview_score(score_result: dict | None) -> int | None:
+    """Extract the numeric interview score from a score_result's 'XX / 100' string.
+
+    Single source of truth for this parse — previously copy-pasted with slightly
+    different edge-case handling in database.py, batch.py (x2), and openings.py (x2).
+    """
+    if not score_result:
+        return None
+    raw = score_result.get("interview_score", "0 / 100")
+    try:
+        return int(str(raw).split("/")[0].strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _combined_score(resume_score, interview_score) -> int | None:
+    """Weighted resume/interview combined score (40/60), or None if either half is missing."""
+    if resume_score is None or interview_score is None:
+        return None
+    return round(resume_score * 0.4 + interview_score * 0.6)
+
+
+def _get_cached_analysis(key: str) -> dict | None:
+    """Previously computed resume analysis for these exact inputs, if any."""
+    if not _db_engine or not key:
+        return None
+    try:
+        with _db_engine.connect() as conn:
+            row = conn.execute(_sql("SELECT result FROM analyze_cache WHERE key = :k"), {"k": key}).first()
+            return row[0] if row else None
+    except Exception as e:
+        print(f"[DB] _get_cached_analysis failed: {e}")
+        return None
+
+
+def _set_cached_analysis(key: str, result: dict):
+    """Store a resume analysis so identical inputs never re-score differently."""
+    if not _db_engine or not key or not result:
+        return
+    try:
+        with _db_engine.connect() as conn:
+            conn.execute(_sql("""
+                INSERT INTO analyze_cache (key, result) VALUES (:k, CAST(:r AS jsonb))
+                ON CONFLICT (key) DO NOTHING
+            """), {"k": key, "r": json.dumps(result)})
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] _set_cached_analysis failed: {e}")
+
+
 def _cb_ts(iso_str):
     if not iso_str:
         return None
@@ -219,17 +282,19 @@ def _save_opening(oid: str, data: dict):
     try:
         with _db_engine.connect() as conn:
             conn.execute(_sql("""
-                INSERT INTO job_openings (id, title, jd_text, jd_fields, created_at)
-                VALUES (:id, :title, :jd_text, CAST(:jd_fields AS jsonb), COALESCE(:created_at, NOW()))
+                INSERT INTO job_openings (id, title, jd_text, jd_fields, qualification_threshold, created_at)
+                VALUES (:id, :title, :jd_text, CAST(:jd_fields AS jsonb), :threshold, COALESCE(:created_at, NOW()))
                 ON CONFLICT (id) DO UPDATE SET
-                    title     = EXCLUDED.title,
-                    jd_text   = EXCLUDED.jd_text,
-                    jd_fields = EXCLUDED.jd_fields
+                    title                   = EXCLUDED.title,
+                    jd_text                 = EXCLUDED.jd_text,
+                    jd_fields               = EXCLUDED.jd_fields,
+                    qualification_threshold = EXCLUDED.qualification_threshold
             """), {
                 "id":         oid,
                 "title":      data.get("title", ""),
                 "jd_text":    data.get("jd", ""),
                 "jd_fields":  json.dumps(data.get("jd_fields") or {}),
+                "threshold":  data.get("qualification_threshold", 70),
                 "created_at": _cb_ts(data.get("createdAt")),
             })
             conn.commit()
@@ -248,12 +313,10 @@ def _delete_opening(oid: str):
         print(f"[DB] _delete_opening failed for {oid}: {e}")
 
 
-def _save_interview(iid: str, data: dict):
-    if not _db_engine:
-        return
-    try:
-        with _db_engine.connect() as conn:
-            conn.execute(_sql("""
+def _upsert_interview_stmt(conn, iid: str, data: dict):
+    """Statement body shared by _save_interview() and _save_interview_complete().
+    Does not commit — the caller's connection controls the transaction boundary."""
+    conn.execute(_sql("""
                 INSERT INTO interviews (
                     id, opening_id, status, consent_status, consent_raw, consent_re_asked,
                     candidate_name, phone, job_title, jd_text, twilio_call_sid,
@@ -315,27 +378,32 @@ def _save_interview(iid: str, data: dict):
                 "score_result":          json.dumps(data["score_result"]) if data.get("score_result") else None,
                 "call_log":              json.dumps(data.get("call_log", [])),
             })
+
+
+def _save_interview(iid: str, data: dict):
+    if not _db_engine:
+        return
+    try:
+        with _db_engine.connect() as conn:
+            _upsert_interview_stmt(conn, iid, data)
             conn.commit()
     except Exception as e:
         print(f"[DB] _save_interview failed for {iid}: {e}")
 
 
-def _save_transcript_entries(iid: str, data: dict):
-    if not _db_engine:
-        return
+def _upsert_transcript_entries_stmt(conn, iid: str, data: dict):
+    """Statement body shared by _save_transcript_entries() and _save_interview_complete()."""
     questions      = data.get("questions", [])
     transcriptions = data.get("transcriptions", {})
     recordings     = data.get("recordings", {})
     repeat_counts  = data.get("repeat_counts", {})
     if not questions:
         return
-    try:
-        with _db_engine.connect() as conn:
-            for i, q_text in enumerate(questions):
-                answer = transcriptions.get(i) or transcriptions.get(str(i))
-                rec    = recordings.get(i) or recordings.get(str(i))
-                rc     = repeat_counts.get(i, 0) or repeat_counts.get(str(i), 0)
-                conn.execute(_sql("""
+    for i, q_text in enumerate(questions):
+        answer = transcriptions.get(i) or transcriptions.get(str(i))
+        rec    = recordings.get(i) or recordings.get(str(i))
+        rc     = repeat_counts.get(i, 0) or repeat_counts.get(str(i), 0)
+        conn.execute(_sql("""
                     INSERT INTO transcript_entries
                         (interview_id, question_index, question_text, answer_text, recording_url, repeat_count)
                     VALUES (:iid, :idx, :q, :a, :rec, :rc)
@@ -345,32 +413,29 @@ def _save_transcript_entries(iid: str, data: dict):
                         recording_url = EXCLUDED.recording_url,
                         repeat_count  = EXCLUDED.repeat_count
                 """), {"iid": iid, "idx": i, "q": q_text, "a": answer, "rec": rec, "rc": rc or 0})
+
+
+def _save_transcript_entries(iid: str, data: dict):
+    if not _db_engine:
+        return
+    try:
+        with _db_engine.connect() as conn:
+            _upsert_transcript_entries_stmt(conn, iid, data)
             conn.commit()
     except Exception as e:
         print(f"[DB] _save_transcript_entries failed for {iid}: {e}")
 
 
-def _sync_candidate_interview(interview_id: str, data: dict):
-    if not _db_engine:
-        return
-    status       = data.get("status", "pending")
-    score_result = data.get("score_result")
-    interview_score = None
-    combined_score  = None
-    if score_result:
-        try:
-            raw = score_result.get("interview_score", "0 / 100")
-            interview_score = int(str(raw).split("/")[0].strip())
-        except Exception:
-            pass
-    try:
-        with _db_engine.connect() as conn:
-            row = conn.execute(_sql(
-                "SELECT resume_score FROM batch_candidates WHERE interview_id = :iid LIMIT 1"
-            ), {"iid": interview_id}).mappings().first()
-            if row and row["resume_score"] is not None and interview_score is not None:
-                combined_score = round((row["resume_score"] * 0.4) + (interview_score * 0.6))
-            conn.execute(_sql("""
+def _upsert_candidate_sync_stmt(conn, interview_id: str, data: dict):
+    """Statement body shared by _sync_candidate_interview() and _save_interview_complete()."""
+    status          = data.get("status", "pending")
+    score_result    = data.get("score_result")
+    interview_score = _parse_interview_score(score_result)
+    row = conn.execute(_sql(
+        "SELECT resume_score FROM batch_candidates WHERE interview_id = :iid LIMIT 1"
+    ), {"iid": interview_id}).mappings().first()
+    combined_score = _combined_score(row["resume_score"], interview_score) if row else None
+    conn.execute(_sql("""
                 UPDATE batch_candidates SET
                     interview_status      = :status,
                     interview_score       = :iscore,
@@ -387,9 +452,43 @@ def _sync_candidate_interview(interview_id: str, data: dict):
                 "score_result": json.dumps(score_result) if score_result else None,
                 "cb_at":        _cb_ts(data.get("callback_scheduled_at")),
             })
+
+
+def _sync_candidate_interview(interview_id: str, data: dict):
+    if not _db_engine:
+        return
+    try:
+        with _db_engine.connect() as conn:
+            _upsert_candidate_sync_stmt(conn, interview_id, data)
             conn.commit()
     except Exception as e:
         print(f"[DB] _sync_candidate_interview failed for {interview_id}: {e}")
+
+
+def _save_interview_complete(iid: str, data: dict) -> bool:
+    """Atomically persist a finished interview: the interviews row, its per-question
+    transcript_entries, and the batch_candidates sync — all in one transaction.
+
+    Previously these were three separate connections/commits (_save_interview,
+    _save_transcript_entries, _sync_candidate_interview called in sequence) — if the
+    second or third failed after the first succeeded, interviews and batch_candidates
+    silently drifted out of sync with nothing beyond a printed log line. Now either
+    all three land together or none do (the connection rolls back on exception since
+    conn.commit() is never reached), and the caller gets a real True/False to act on
+    instead of three independently-swallowed exceptions.
+    """
+    if not _db_engine:
+        return False
+    try:
+        with _db_engine.connect() as conn:
+            _upsert_interview_stmt(conn, iid, data)
+            _upsert_transcript_entries_stmt(conn, iid, data)
+            _upsert_candidate_sync_stmt(conn, iid, data)
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] _save_interview_complete failed for {iid} — transaction rolled back, interviews/batch_candidates NOT updated: {e}")
+        return False
 
 
 def _link_single_candidate_interview(single_id: str, interview_id: str):
@@ -409,7 +508,7 @@ def _link_single_candidate_interview(single_id: str, interview_id: str):
         print(f"[DB] _link_single_candidate_interview failed: {e}")
 
 
-def _save_single_candidate(single_id: str, opening_id: str | None, resume_text: str, result: dict):
+def _save_single_candidate(single_id: str, opening_id: str | None, resume_text: str, result: dict, threshold: int = 70):
     if not _db_engine:
         return
     score_str = result.get("match_score", "0 / 100")
@@ -417,7 +516,7 @@ def _save_single_candidate(single_id: str, opening_id: str | None, resume_text: 
         score_num = int(str(score_str).split("/")[0].strip())
     except Exception:
         score_num = 0
-    filter_status = "qualified" if score_num >= 70 else "filtered_out"
+    filter_status = "qualified" if score_num >= threshold else "filtered_out"
     try:
         with _db_engine.connect() as conn:
             conn.execute(_sql("""
@@ -432,7 +531,15 @@ def _save_single_candidate(single_id: str, opening_id: str | None, resume_text: 
                     :resume_score, :filter_status, 'pending',
                     :resume_text, CAST(:analyze_result AS jsonb), NOW()
                 )
-                ON CONFLICT (single_id) DO UPDATE SET
+                -- The WHERE predicate is REQUIRED, not decoration: single_id is covered by a
+                -- PARTIAL unique index (idx_bc_single ... WHERE single_id IS NOT NULL), and
+                -- Postgres will only infer a partial index for ON CONFLICT if the statement
+                -- repeats its predicate. Without it every insert failed with "there is no
+                -- unique or exclusion constraint matching the ON CONFLICT specification", so
+                -- NO single-candidate row was ever saved — which meant single candidates never
+                -- appeared in the rankings table and their interview scores had no row to sync
+                -- to (also why resume_text came back missing for the Whisper vocabulary hint).
+                ON CONFLICT (single_id) WHERE single_id IS NOT NULL DO UPDATE SET
                     opening_id    = EXCLUDED.opening_id,
                     name          = EXCLUDED.name,
                     email         = EXCLUDED.email,
@@ -485,7 +592,7 @@ def _save_batch(bid: str, data: dict):
                 "completed":  data.get("completed", 0),
             })
             for c in data.get("candidates", []):
-                conn.execute(_sql("""
+                result = conn.execute(_sql("""
                     INSERT INTO batch_candidates (
                         batch_id, interview_id, file_name, name, email, phone,
                         resume_score, filter_status, interview_status, interview_score,
@@ -512,6 +619,7 @@ def _save_batch(bid: str, data: dict):
                         analyze_result        = EXCLUDED.analyze_result,
                         score_result          = EXCLUDED.score_result,
                         updated_at            = NOW()
+                    RETURNING id
                 """), {
                     "batch_id":              bid,
                     "interview_id":          c.get("interview_id"),
@@ -529,6 +637,12 @@ def _save_batch(bid: str, data: dict):
                     "analyze_result":        json.dumps(c["analyze_result"]) if c.get("analyze_result") else None,
                     "score_result":          json.dumps(c["score_result"])    if c.get("score_result")    else None,
                 })
+                row = result.first()
+                if row:
+                    # Attach the DB-assigned PK back onto the same in-memory candidate dict
+                    # (data["candidates"] is the live batch_store entry, not a copy) so later
+                    # /batch/status polls can reference it — e.g. the qualify-override action.
+                    c["_bc_id"] = row[0]
             conn.commit()
     except Exception as e:
         print(f"[DB] _save_batch failed for {bid}: {e}")
@@ -779,6 +893,57 @@ def _delete_interview(interview_id: str):
         print(f"[DB] _delete_interview failed for {interview_id}: {e}")
 
 
+def _list_repairable_interviews(minutes: int = 30, limit: int = 25) -> list[str]:
+    """Just-finished interviews flagged incomplete, for the answer-repair safety net.
+
+    An interview lands here when a recording arrived (or became transcribable) only after
+    scoring had finished, so the row reads "incomplete" while the provider holds the audio.
+
+    The window is short on purpose: this exists to get the CURRENT call right, not to rewrite
+    history. An older result may already have been acted on, and re-scoring the same transcript
+    does not reproduce an identical number, so silently revising it would do more harm than the
+    stale flag it fixes.
+    """
+    if not _db_engine:
+        return []
+    try:
+        with _db_engine.connect() as conn:
+            rows = conn.execute(_sql(f"""
+                SELECT id FROM interviews
+                 WHERE status = 'completed'
+                   AND score_result IS NOT NULL
+                   AND (score_result ->> 'incomplete') = 'true'
+                   AND updated_at > NOW() - INTERVAL '{int(minutes)} minutes'
+                 ORDER BY updated_at DESC
+                 LIMIT :lim
+            """), {"lim": limit}).fetchall()
+            return [str(r[0]) for r in rows]
+    except Exception as e:
+        print(f"[DB] _list_repairable_interviews failed: {e}")
+        return []
+
+
+def _get_resume_text_for_interview(interview_id: str) -> str | None:
+    """Resume text for the candidate linked to this interview, if any.
+
+    Used to seed Whisper's vocabulary hint with the candidate's real proper nouns (college,
+    employers, technologies) so they aren't mis-transcribed. interview_store doesn't carry
+    resume_text, so it's read from batch_candidates on demand — only from the post-call
+    scoring pass, never on a latency-sensitive webhook path.
+    """
+    if not _db_engine:
+        return None
+    try:
+        with _db_engine.connect() as conn:
+            row = conn.execute(_sql(
+                "SELECT resume_text FROM batch_candidates WHERE interview_id = :iid AND resume_text IS NOT NULL LIMIT 1"
+            ), {"iid": interview_id}).first()
+            return row[0] if row else None
+    except Exception as e:
+        print(f"[DB] _get_resume_text_for_interview failed for {interview_id}: {e}")
+        return None
+
+
 def _get_interview_status_from_db(interview_id: str):
     if not _db_engine:
         return None
@@ -853,6 +1018,32 @@ def _link_candidate_interview_by_bcid(bc_id: int, interview_id: str):
         print(f"[DB] _link_candidate_interview_by_bcid failed: {e}")
 
 
+def _override_qualify_candidate(bc_id: int) -> bool:
+    """Manually promote a filtered-out (but callable) candidate to 'qualified'.
+
+    Guarded on phone IS NOT NULL — a candidate with no phone number can't
+    actually be called, so promoting them wouldn't be meaningful (mirrors the
+    existing filter_status='no_phone' invariant: qualified implies callable).
+    Returns False if the row doesn't exist or has no phone number.
+    """
+    if not _db_engine or not bc_id:
+        return False
+    try:
+        with _db_engine.connect() as conn:
+            result = conn.execute(_sql("""
+                UPDATE batch_candidates
+                SET filter_status = 'qualified', updated_at = NOW()
+                WHERE id = :bcid AND phone IS NOT NULL
+                RETURNING id
+            """), {"bcid": bc_id})
+            row = result.first()
+            conn.commit()
+            return row is not None
+    except Exception as e:
+        print(f"[DB] _override_qualify_candidate failed for {bc_id}: {e}")
+        return False
+
+
 def _reset_candidate_on_call_failure(bc_id: int, interview_id: str):
     """Reset batch_candidates after _start_candidate_call fails — clears stale 'calling' state."""
     if not _db_engine or not bc_id:
@@ -890,6 +1081,7 @@ def load_stores() -> tuple[dict, dict, dict]:
                     "title":     orow["title"],
                     "jd":        orow["jd_text"] or "",
                     "jd_fields": orow["jd_fields"] or {},
+                    "qualification_threshold": orow.get("qualification_threshold", 70),
                     "createdAt": ca.date().isoformat() if ca else "",
                     "stats":     {"total": 0, "qualified": 0, "done": 0},
                     "batchIds":  [],

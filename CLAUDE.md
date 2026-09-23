@@ -72,6 +72,10 @@ PLIVO_AUTH_ID=...                 # optional — only if using Plivo as call pro
 PLIVO_AUTH_TOKEN=...
 PLIVO_PHONE_NUMBER=+1...
 CALL_PROVIDER=twilio               # optional — default provider ("twilio" or "plivo"), toggle at runtime via /settings
+INTERVIEW_MODE=legacy              # optional — "legacy" (press #) or "streaming" (auto end-of-answer), toggle via /settings
+DEEPGRAM_API_KEY=...               # streaming mode — Deepgram Flux STT ($200 signup credit)
+AZURE_SPEECH_KEY=...               # streaming mode — Azure Neural TTS (F0 tier: 500k chars/mo free forever)
+AZURE_SPEECH_REGION=centralindia   # streaming mode — Azure region of the Speech resource
 BASE_URL=https://xxxx.ngrok.io    # auto-set on startup if ngrok running
 COMPANY_NAME=NickelFox Technologies
 SUPER_ADMIN_USERNAME=director
@@ -106,9 +110,11 @@ backend/
     openings.py      — Job openings CRUD
     health.py        — Health check endpoint
     resume.py        — Single resume analyze endpoint
-    settings.py      — GET/PUT /settings (super_admin) — toggle call_provider twilio/plivo
+    settings.py      — GET/PUT /settings (super_admin) — toggle call_provider twilio/plivo + interview_mode legacy/streaming
+    stream.py        — Streaming-mode routes: /twilio|/plivo/stream-xml/{id} (answer XML) + /ws/twilio|/ws/plivo/{id} (websockets)
   services/
     interviewer.py       — Claude (questions + scoring), Groq Whisper, start_twilio_call()
+    voice_agent.py       — Streaming interview agent (Pipecat): InterviewFlowProcessor state machine, STT/TTS builders, run_interview_session()
     email_service.py     — Amazon SES SMTP welcome emails
     recording_cleanup.py — Daily job deleting recordings older than 89 days (Twilio + Plivo)
   utils/
@@ -149,6 +155,7 @@ frontend/src/
 | `pipeline_store` | `pipeline_id` (UUID) | Queue, active, completed, skipped, status |
 | `opening_pipeline` | `opening_id` | `pipeline_id` — one active pipeline per opening |
 | `settings_store` | `"call_provider"` | Active call provider (`"twilio"` or `"plivo"`) |
+| `settings_store` | `"interview_mode"` | `"legacy"` (press #) or `"streaming"` (Pipecat voice agent) — seeded from `INTERVIEW_MODE` env, DB-persisted like `call_provider` |
 
 `interview_store` is the live source of truth during a call. DB is ~1-2s behind. On startup, all stores are restored from PostgreSQL. `settings_store["call_provider"]` is seeded from the `CALL_PROVIDER` env var at import time, then **overridden by the DB-persisted value** (`app_settings` table) during the `main.py` lifespan startup — so a provider switch made via `PUT /settings` survives server restarts. See `app_settings` in Database Schema below.
 
@@ -267,8 +274,16 @@ Generic key/value store for runtime settings that must survive restarts. Current
 |--------|------|-------------|
 | GET | `/callbacks/due` | List overdue scheduled callbacks |
 | GET | `/health` | Health check |
-| GET | `/settings` | Get active call provider (super_admin only) |
-| PUT | `/settings` | Set active call provider — `"twilio"` or `"plivo"` (super_admin only) |
+| GET | `/settings` | Get active call provider + interview mode (super_admin only) |
+| PUT | `/settings` | Set `call_provider` (`"twilio"`/`"plivo"`) and/or `interview_mode` (`"legacy"`/`"streaming"`) (super_admin only) |
+
+### Streaming Mode (`backend/api/routes/stream.py` — public like the other webhooks)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET/POST | `/twilio/stream-xml/{id}` | Answer TwiML: `<Connect><Stream url="wss://…/ws/twilio/{id}"/></Connect>` |
+| GET/POST | `/plivo/stream-xml/{id}` | Answer XML: `<Stream bidirectional keepCallAlive contentType="audio/x-mulaw;rate=8000">wss://…</Stream>`; also starts Plivo full-call recording (same fire-and-forget pattern as `/plivo/start`) |
+| WS | `/ws/twilio/{id}` | Twilio Media Streams websocket → shared Pipecat pipeline |
+| WS | `/ws/plivo/{id}` | Plivo AudioStream websocket → same pipeline, Plivo serializer |
 
 ---
 
@@ -404,6 +419,71 @@ message. Only the provider-specific mechanics differ:
 /plivo/status/{id}  [fires when Plivo call reaches terminal state — hangup_url]
   → identical logic to /twilio/status/{id}; CallStatus is the same field name for both providers
 ```
+
+## Streaming Interview Mode (`interview_mode=streaming`)
+
+Files: `backend/services/voice_agent.py`, `backend/api/routes/stream.py`. Toggled at runtime via
+`PUT /settings {"interview_mode": "streaming"}` (DB-persisted, like `call_provider`); the legacy
+`#`-key flow stays fully intact as `"legacy"` and is the default.
+
+Instead of the webhook/`<Record>` loop, the call is bridged into ONE shared Pipecat pipeline
+(same code for both providers — only the websocket serializer differs):
+
+```
+transport.input (mulaw 8k)
+  → VADProcessor (Silero, local)
+  → STT            Deepgram Flux multilingual (default; semantic end-of-turn in the model,
+                    eot_threshold 0.8 / eot_timeout 7s) — or nova-3 language=multi, or
+                    VOICE_AGENT_STT=groq (free: Groq Whisper segmented per turn)
+  → UserTurnProcessor  (strategy depends on STT — see below; also drives barge-in)
+  → InterviewFlowProcessor  (scripted state machine: consent → Q1..Q7 → closing |
+                             callback_time; reuses _detect_consent/_parse_callback_time/
+                             _is_repeat_request/REPEAT_KEYWORDS/_TRANSITIONS unchanged)
+  → TTS            Azure Neural (AZURE_TTS_VOICE, default en-IN-NeerjaNeural)
+  → transport.output
+```
+
+Turn detection is chosen per-STT in `_build_stt()` (`voice_agent.py`), not a single fixed strategy:
+- **Deepgram Flux** defines its own turn boundaries and calls Pipecat's `broadcast_interruption()`
+  itself — `UserTurnProcessor` is configured with `ExternalUserTurnStrategies()` to defer to Flux
+  entirely rather than running a second, uncoordinated VAD+smart-turn-v3 detector in parallel
+  (confirmed by reading Pipecat's source: nothing auto-applies Flux's `STTMetadataFrame.user_turn_strategies`
+  hint outside the `LLMContextAggregatorPair` pattern, which this app doesn't use).
+- **Groq** (segmented/batch, no native turn concept) uses the library default: Silero VAD start +
+  local smart-turn-v3 semantic stop (bundled ONNX model, CPU).
+- **Deepgram nova-3** (non-Flux fallback, real interim transcripts) uses a min-words start strategy
+  for a better backchannel filter than raw VAD onset.
+- A short grace window in `InterviewFlowProcessor` (`VOICE_AGENT_INTERRUPT_GRACE_SECS`, default 1.5s)
+  additionally catches very short utterances that interrupt right as a prompt starts speaking
+  (backchannel filler like "mm"/"haan"/"okay") and re-states the prompt instead of treating it as
+  a reply, capped at `_MAX_BACKCHANNEL_REPROMPTS` (2) to avoid looping in persistently noisy audio.
+
+Key behaviors / differences from legacy:
+- **No `#` key** — end-of-answer is detected semantically; candidate is told to "just pause".
+- Answers are captured as **live text** in `data["transcriptions"]` (no per-question recording
+  URLs); `_process_interview()` reuses them as cached transcriptions, so scoring/DB/pipeline
+  code is unchanged. Both status callbacks treat non-empty transcriptions as evidence the
+  candidate answered (not "abandoned").
+- Full-call recording still works: Twilio `record=True`; Plivo via `calls.record()` fired from
+  `/plivo/stream-xml`. `twilio_call_sid` is captured from the stream's start message.
+- Silence: idle timer (`VOICE_AGENT_IDLE_SECS`, default 14s) re-prompts — consent 1×, questions
+  2×, then `[no answer provided]` and advance. Repeat requests: same 2× limit as legacy.
+- Mid-call hangup/stream drop: if answers exist → process what we have; else the provider
+  status callback classifies it (abandoned/no_answer) exactly as legacy.
+- Pipecat missing/broken → `VOICE_AGENT_OK=False`, stream-xml routes return hangup XML, and
+  legacy mode is unaffected.
+
+Tuning env knobs: `DEEPGRAM_STT_MODEL` (default `flux-general-multi`), `DEEPGRAM_EOT_THRESHOLD`,
+`DEEPGRAM_EOT_TIMEOUT_MS`, `DEEPGRAM_STT_LANGUAGE`, `VOICE_AGENT_STT` (`deepgram`|`groq`),
+`AZURE_TTS_VOICE`, `VOICE_AGENT_VAD_STOP_SECS`, `VOICE_AGENT_TURN_SETTLE_SECS`,
+`VOICE_AGENT_IDLE_SECS`, `VOICE_AGENT_INTERRUPT_GRACE_SECS`.
+
+Repeat-request detection (`_looks_like_repeat_request()` in `interview.py`, shared by legacy Twilio,
+legacy Plivo, and streaming) only matches `REPEAT_KEYWORDS` within the first ~8 words of an utterance
+— a long legitimate answer that happens to use the word "repeat" naturally no longer misfires. If the
+2-repeat cap is hit, the repeat-request text itself is never stored as the candidate's answer (would
+unfairly tank their score) — `"[declined to answer after repeat requests]"` is stored instead, in all
+three call flows.
 
 ### `_process_interview()` (background thread, `interview.py`)
 1. `_processing_started` guard + `try/finally` cleanup (prevents permanent lock on crash)

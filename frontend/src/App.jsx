@@ -191,6 +191,17 @@ export default function App() {
     clearInterview()
   }
 
+  // `interview` is one flat piece of state shared across every single-candidate analysis in
+  // this session, independent of which candidate is on screen. Analyzing a résumé already
+  // resets the score/result for the new candidate, but nothing cleared the PREVIOUS
+  // candidate's leftover interview status — so if any earlier test call on this opening (or
+  // any other) ended up abandoned/declined/failed, that banner kept showing under every new
+  // candidate analyzed afterward, even though no call had been placed for them at all.
+  const handleAnalyzeFresh = (rText, jText) => {
+    clearInterview()
+    return handleAnalyze(rText, jText)
+  }
+
   // ── pipeline state ──
   const [pipelineStatuses, setPipelineStatuses] = useState({}) // {opening_id: status_obj}
   const pipelinePolls = useRef({}) // {opening_id: intervalId}
@@ -854,7 +865,7 @@ export default function App() {
                 key={activeOpeningId || 'single-no-opening'}
                 mode="single"
                 defaultJd={defaultJd}
-                onAnalyze={handleAnalyze}
+                onAnalyze={handleAnalyzeFresh}
                 onClear={handleClearAll}
                 loading={loading}
                 error={error}
@@ -892,7 +903,7 @@ export default function App() {
                   key={activeOpeningId || 'batch-no-opening'}
                   mode="batch"
                   defaultJd={defaultJd}
-                  onAnalyze={handleAnalyze}
+                  onAnalyze={handleAnalyzeFresh}
                   onClear={handleClearAll}
                   loading={loading}
                   error={error}

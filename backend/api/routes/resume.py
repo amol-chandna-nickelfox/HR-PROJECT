@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from backend.services.analyzer import analyze, parse_resume
 from backend.utils.file_utils import extract_text
 from backend.app.database import _save_single_candidate
-from backend.app.state import opening_store
+from backend.app.state import opening_store, get_qualification_threshold
 
 router = APIRouter()
 
@@ -31,7 +31,8 @@ async def analyze_resume(req: AnalyzeRequest):
             jd_fields = opening.get('jd_fields') or None
     result = analyze(req.resume_text, req.jd_text, jd_fields=jd_fields)
     if req.single_id:
-        _save_single_candidate(req.single_id, req.opening_id, req.resume_text, result)
+        threshold = get_qualification_threshold(req.opening_id)
+        _save_single_candidate(req.single_id, req.opening_id, req.resume_text, result, threshold=threshold)
     return result
 
 

@@ -68,6 +68,8 @@ def _start_candidate_call(pipeline_id: str, candidate: dict, pipeline: dict) -> 
             "fail_reason":           None,
             "processing_step":       None,
             "questions":             questions,
+            # In-memory only — seeds the Whisper vocabulary hint (see _vocab_for in interview.py)
+            "resume_text":           resume_text,
             "recordings":            {},
             "transcriptions":        {},
             "repeat_counts":         {},

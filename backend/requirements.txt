@@ -12,3 +12,9 @@ apscheduler>=3.10.0
 anthropic>=0.25.0
 sqlalchemy>=2.0
 psycopg>=3.0
+plivo>=4.47.0
+PyJWT>=2.8.0
+# Streaming interview agent (interview_mode=streaming) — Pipecat pipeline:
+# deepgram = streaming STT + turn detection, azure = neural TTS,
+# silero = local VAD, groq = free segmented-STT fallback (VOICE_AGENT_STT=groq)
+pipecat-ai[deepgram,azure,silero,groq]>=0.0.60

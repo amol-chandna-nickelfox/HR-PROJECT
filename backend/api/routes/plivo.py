@@ -10,11 +10,11 @@ from fastapi import APIRouter, BackgroundTasks, Request, Form
 
 from backend.services.interviewer import transcribe_recording, plivo_client, HALLUCINATION_MARKER
 from backend.app.database import _save_interview, _save_transcript_entries, _sync_candidate_interview
-from backend.app.state import _scheduler, _SCHEDULER_OK
+from backend.app.state import _scheduler, _SCHEDULER_OK, TERMINAL_INTERVIEW_STATUSES
 from backend.app.callbacks import _trigger_callback_call
 from backend.api.routes.interview import (
     _get_interview, _detect_consent, _parse_callback_time, _is_repeat_request,
-    _process_interview, _xml, _hangup_xml, REPEAT_KEYWORDS, _TRANSITIONS,
+    _process_interview, _xml, _hangup_xml, _looks_like_repeat_request, _vocab_for, _TRANSITIONS,
 )
 
 router = APIRouter()
@@ -373,7 +373,7 @@ async def plivo_answer(
                     _result_holder = [None]
                     def _transcribe_bg():
                         try:
-                            _result_holder[0] = transcribe_recording(rec_url_val, fast=False)
+                            _result_holder[0] = transcribe_recording(rec_url_val, fast=False, vocab=_vocab_for(data))
                         except Exception as _te:
                             print(f"[Plivo answer] transcription error: {_te}")
                     _t = _th.Thread(target=_transcribe_bg, daemon=True)
@@ -387,16 +387,13 @@ async def plivo_answer(
                 except Exception as te:
                     print(f"[Plivo answer] inline transcription failed: {te}")
 
-                _qt_lower = quick_text.lower() if quick_text else ""
-                is_repeat = bool(quick_text) and any(
-                    re.search(r'(?<!\w)' + re.escape(kw) + r'(?!\w)', _qt_lower)
-                    for kw in REPEAT_KEYWORDS
-                )
+                is_repeat = bool(quick_text) and _looks_like_repeat_request(quick_text)
 
                 # Claude fallback: only for very short responses to avoid false positives
                 if not is_repeat and quick_text and len(quick_text.split()) < 8:
                     is_repeat = _is_repeat_request(quick_text)
 
+                _repeat_cap_reached = False
                 if is_repeat:
                     repeat_count = data["repeat_counts"].get(q_idx, 0)
                     if repeat_count < 2:
@@ -416,12 +413,17 @@ async def plivo_answer(
                             f"</Response>"
                         )
                     else:
-                        print(f"[Plivo answer] repeat limit reached q={q_idx} — moving on")
+                        # Move on WITHOUT recording the repeat-request text itself as the
+                        # candidate's answer — that would unfairly tank their score.
+                        print(f"[Plivo answer] repeat limit reached q={q_idx} — moving on without scoring the repeat request")
+                        data["recordings"][q_idx] = rec_url_val
+                        data["transcriptions"][q_idx] = "[declined to answer after repeat requests]"
                         is_repeat = False
+                        _repeat_cap_reached = True
 
                 # Spoke but didn't press # and transcription isn't a repeat
                 # Skip if maxLength (120s) was hit — treat as completed answer
-                if duration > 6 and not Digits and duration < 118:
+                if not _repeat_cap_reached and duration > 6 and not Digits and duration < 118:
                     print(f"[Plivo answer] spoke then paused q={q_idx} — prompting press #")
                     # Save this segment instead of silently discarding it — a candidate who
                     # pauses mid-answer (e.g. to think through a technical question) would
@@ -442,16 +444,17 @@ async def plivo_answer(
                         f"</Response>"
                     )
 
-                data["recordings"][q_idx] = rec_url_val
-                # Don't cache a hallucination-flagged result as final — treat it the same
-                # as an inline-transcription timeout (quick_text=None) and leave it unset so
-                # _process_interview()'s background pass gets a genuine, unhurried second
-                # attempt at this recording (which may also be more fully processed/available
-                # by then than during the live call's 12s inline window).
-                if quick_text and quick_text != HALLUCINATION_MARKER:
-                    # Merge in any earlier segments saved before a mid-answer pause.
-                    pending = data.get("_pending_answer_parts", {}).pop(q_idx, None)
-                    data["transcriptions"][q_idx] = " ".join(pending + [quick_text]) if pending else quick_text
+                if not _repeat_cap_reached:
+                    data["recordings"][q_idx] = rec_url_val
+                    # Don't cache a hallucination-flagged result as final — treat it the same
+                    # as an inline-transcription timeout (quick_text=None) and leave it unset so
+                    # _process_interview()'s background pass gets a genuine, unhurried second
+                    # attempt at this recording (which may also be more fully processed/available
+                    # by then than during the live call's 12s inline window).
+                    if quick_text and quick_text != HALLUCINATION_MARKER:
+                        # Merge in any earlier segments saved before a mid-answer pause.
+                        pending = data.get("_pending_answer_parts", {}).pop(q_idx, None)
+                        data["transcriptions"][q_idx] = " ".join(pending + [quick_text]) if pending else quick_text
 
             if q_idx + 1 < total:
                 data["status"] = "calling"
@@ -512,10 +515,14 @@ async def plivo_status_callback(interview_id: str, request: Request, background_
     terminal_call = {"completed", "no-answer", "busy", "failed", "canceled", "cancel"}
     if call_status not in terminal_call:
         return {"status": "ok"}
-    if data["status"] in ("processing", "completed", "abandoned", "failed", "callback_scheduled"):
+    if data["status"] in TERMINAL_INTERVIEW_STATUSES:
         return {"status": "ok"}
 
     recordings = data.get("recordings", {})
+    # Streaming-mode interviews (voice_agent.py) capture answers as live text with no
+    # per-question recordings — count either as evidence the candidate answered.
+    answers    = {k: v for k, v in data.get("transcriptions", {}).items()
+                  if v and v != "[no answer provided]"}
     call_log   = data.get("call_log", [])
     now_iso    = datetime.now().isoformat()
     if call_status in ("no-answer", "busy"):
@@ -523,7 +530,7 @@ async def plivo_status_callback(interview_id: str, request: Request, background_
         data["fail_reason"] = "Call not answered" if call_status == "no-answer" else "Candidate's line was busy"
         if call_log:
             call_log[-1].update({"status": "failed", "ended_at": now_iso, "fail_reason": data["fail_reason"]})
-    elif len(recordings) == 0:
+    elif len(recordings) == 0 and len(answers) == 0:
         data["status"]      = "abandoned"
         data["fail_reason"] = "Candidate disconnected before answering any question"
         if call_log:

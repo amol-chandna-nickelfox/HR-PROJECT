@@ -29,7 +29,7 @@ export default function BatchProgress({ batchData }) {
       <div className="batch-candidate-list">
         {candidates.map((c, i) => {
           const st  = STATUS_MAP[c.interview_status] || { label: c.interview_status || '…', cls: '' }
-          const isFiltered = c.filter_status === 'filtered_out' || c.filter_status === 'no_phone'
+          const isFiltered = c.filter_status === 'filtered_out' || c.filter_status === 'no_phone' || c.filter_status === 'parse_failed'
 
           return (
             <div key={i} className="batch-candidate-row">
@@ -58,8 +58,11 @@ export default function BatchProgress({ batchData }) {
               </div>
 
               {isFiltered ? (
-                <span style={{ fontSize: '0.72rem', color: 'var(--text-3)' }}>
-                  {c.filter_status === 'no_phone' ? 'No Phone' : 'Filtered Out'}
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-3)' }}
+                  title={c.filter_status === 'parse_failed' ? "Couldn't extract text from this file — try re-uploading it" : undefined}>
+                  {c.filter_status === 'no_phone' ? 'No Phone'
+                    : c.filter_status === 'parse_failed' ? "⚠ Couldn't Read File"
+                    : 'Filtered Out'}
                 </span>
               ) : (
                 <span className={`score-verdict ${st.cls}`} style={{ fontSize: '0.72rem', padding: '2px 10px' }}>
